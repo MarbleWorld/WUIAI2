@@ -2,35 +2,14 @@ import os
 import re
 import io
 import json
-import time
-import math
-import queue
-import hashlib
-import threading
-import xml.etree.ElementTree as ET
-from dataclasses import dataclass, asdict
-from datetime import datetime, timedelta, timezone
-from typing import List, Dict, Optional, Tuple
-from urllib.parse import urljoin, urlparse, urldefrag
-from urllib.robotparser import RobotFileParser
-
 import requests
 import pandas as pd
 import streamlit as st
 import trafilatura
+import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
+from urllib.parse import urlparse
 from bs4 import BeautifulSoup
-
-try:
-    import chromadb
-    from chromadb.config import Settings
-except Exception:
-    chromadb = None
-    Settings = None
-
-try:
-    from sentence_transformers import SentenceTransformer
-except Exception:
-    SentenceTransformer = None
 
 try:
     from openai import OpenAI
@@ -42,17 +21,12 @@ try:
 except Exception:
     pypdf = None
 
-try:
-    import pydeck as pdk
-except Exception:
-    pdk = None
-
 
 # =========================================================
 # PAGE CONFIG
 # =========================================================
 st.set_page_config(
-    page_title="Wildfire Knowledge Lab Pro",
+    page_title="Wildfire Knowledge Lab",
     page_icon="🔥",
     layout="wide",
 )
@@ -61,9 +35,9 @@ st.markdown("""
 <style>
 .block-container {
     max-width: 100% !important;
-    padding-left: 2.2rem;
-    padding-right: 2.2rem;
-    padding-top: 1.0rem;
+    padding-left: 2rem;
+    padding-right: 2rem;
+    padding-top: 1rem;
 }
 #MainMenu {visibility: hidden;}
 footer {visibility: hidden;}
@@ -83,14 +57,7 @@ header {visibility: hidden;}
     border-radius: 18px;
     padding: 0.9rem 1rem;
 }
-.source-card {
-    background: rgba(255,255,255,0.03);
-    border: 1px solid rgba(255,255,255,0.08);
-    border-radius: 18px;
-    padding: 0.95rem 1rem;
-    margin-bottom: 0.75rem;
-}
-.incident-card {
+.source-card, .incident-card {
     background: rgba(255,255,255,0.03);
     border: 1px solid rgba(255,255,255,0.08);
     border-radius: 18px;
@@ -125,49 +92,27 @@ textarea, input, [data-baseweb="textarea"] textarea, [data-baseweb="input"] inpu
 # =========================================================
 # CONFIG
 # =========================================================
-APP_TITLE = "Wildfire Knowledge Lab Pro"
-APP_SUBTITLE = "Incident feed + outlook ingestion + fire weather parsing + map + daily briefing + grounded wildfire QA"
+APP_TITLE = "Wildfire Knowledge Lab"
+APP_SUBTITLE = "Incidents + outlooks + fire weather + alerts + uploads + grounded QA"
 
-CHROMA_DIR = os.getenv("WILDFIRE_CHROMA_DIR", "./wildfire_chroma")
-COLLECTION_NAME = os.getenv("WILDFIRE_COLLECTION_NAME", "wildfire_knowledge_pro")
-EMBED_MODEL_NAME = os.getenv("WILDFIRE_EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_API_KEY = st.secrets.get("openai", {}).get("api_key") or os.getenv("OPENAI_API_KEY", "")
 
-USER_AGENT = "WildfireKnowledgeLabPro/2.0 (+research)"
+USER_AGENT = "WildfireKnowledgeLab/1.0 (+research)"
 REQUEST_TIMEOUT = 30
-TOP_K = 8
-CHUNK_SIZE_WORDS = 220
-CHUNK_OVERLAP_WORDS = 40
 
 INCIWEB_RSS_URL = "https://inciweb.wildfire.gov/feeds/rss/incidents/"
 NIFC_MONTHLY_OUTLOOK_PDF = "https://www.nifc.gov/nicc-files/predictive/outlooks/monthly_seasonal_outlook.pdf"
 NIFC_NA_OUTLOOK_PDF = "https://www.nifc.gov/nicc-files/predictive/outlooks/NA_Outlook.pdf"
 NIFC_WEATHER_PAGE = "https://www.nifc.gov/nicc/predictive-services/weather"
 
-DEFAULT_SEEDS = [
-    "https://www.nifc.gov/",
-    "https://www.nwcg.gov/",
-    "https://www.fs.usda.gov/managing-land/fire",
-    "https://www.fire.ca.gov/",
-    "https://www.readyforwildfire.org/",
-    "https://www.weather.gov/",
-]
-
-DEFAULT_ALLOWED_DOMAINS = [
-    "nifc.gov",
-    "nwcg.gov",
-    "fs.usda.gov",
-    "fire.ca.gov",
-    "readyforwildfire.org",
-    "weather.gov",
-]
-
 DEFAULT_FIRE_WEATHER_URLS = [
     "https://www.weather.gov/gjt/fire",
     "https://www.weather.gov/unr/brief_fire",
 ]
 
+if "doc_store" not in st.session_state:
+    st.session_state.doc_store = []
 if "last_answer" not in st.session_state:
     st.session_state.last_answer = ""
 if "last_hits" not in st.session_state:
@@ -176,14 +121,8 @@ if "last_briefing" not in st.session_state:
     st.session_state.last_briefing = ""
 if "last_incidents" not in st.session_state:
     st.session_state.last_incidents = []
-if "last_map_df" not in st.session_state:
-    st.session_state.last_map_df = pd.DataFrame()
 if "ingest_log" not in st.session_state:
     st.session_state.ingest_log = []
-if "latest_stats" not in st.session_state:
-    st.session_state.latest_stats = {"pages": 0, "chunks": 0, "sources": 0}
-if "latest_docs_preview" not in st.session_state:
-    st.session_state.latest_docs_preview = []
 
 
 # =========================================================
@@ -191,17 +130,6 @@ if "latest_docs_preview" not in st.session_state:
 # =========================================================
 def utc_now_iso() -> str:
     return datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def normalize_url(url: str) -> str:
-    url = urldefrag(url)[0].strip()
-    parsed = urlparse(url)
-    return parsed._replace(
-        scheme=parsed.scheme.lower(),
-        netloc=parsed.netloc.lower(),
-        path=re.sub(r"/{2,}", "/", parsed.path),
-        fragment=""
-    ).geturl()
 
 
 def clean_text(text: str) -> str:
@@ -214,77 +142,18 @@ def clean_text(text: str) -> str:
     return text.strip()
 
 
-def safe_hash(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()
+def maybe_trim(text: str, n: int = 1200) -> str:
+    text = text or ""
+    return text[:n] + ("..." if len(text) > n else "")
 
 
-def split_into_word_chunks(text: str, chunk_size_words: int = CHUNK_SIZE_WORDS, overlap_words: int = CHUNK_OVERLAP_WORDS) -> List[str]:
-    words = text.split()
-    if not words:
-        return []
-    chunks = []
-    step = max(1, chunk_size_words - overlap_words)
-    for start in range(0, len(words), step):
-        piece = words[start:start + chunk_size_words]
-        if piece:
-            chunks.append(" ".join(piece))
-        if start + chunk_size_words >= len(words):
-            break
-    return chunks
-
-
-def html_title(html: str, fallback: str = "") -> str:
-    soup = BeautifulSoup(html, "html.parser")
-    if soup.title and soup.title.string:
-        t = clean_text(soup.title.string)
-        if t:
-            return t
-    h1 = soup.find("h1")
-    if h1:
-        t = clean_text(h1.get_text(" ", strip=True))
-        if t:
-            return t
-    return fallback
-
-
-def looks_like_html_url(url: str) -> bool:
-    blocked = (
-        ".pdf", ".jpg", ".jpeg", ".png", ".gif", ".webp", ".zip", ".rar", ".7z",
-        ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".tif", ".tiff",
-        ".csv", ".xml", ".rss", ".atom", ".geojson", ".shp"
-    )
-    return not url.lower().endswith(blocked)
-
-
-def is_allowed_domain(url: str, allowed_domains: List[str]) -> bool:
-    netloc = urlparse(url).netloc.lower()
-    if not netloc:
-        return False
-    for dom in allowed_domains:
-        dom = dom.lower().strip()
-        if netloc == dom or netloc.endswith("." + dom):
-            return True
-    return False
-
-
-def extract_links(base_url: str, html: str) -> List[str]:
-    out = []
-    soup = BeautifulSoup(html, "html.parser")
-    for a in soup.find_all("a", href=True):
-        href = a.get("href", "").strip()
-        if not href:
-            continue
-        full = normalize_url(urljoin(base_url, href))
-        if full.startswith("http://") or full.startswith("https://"):
-            out.append(full)
-    return list(dict.fromkeys(out))
-
-
-def fetch_text_url(url: str, timeout: int = REQUEST_TIMEOUT) -> Tuple[str, str]:
+def fetch_text_url(url: str, timeout: int = REQUEST_TIMEOUT):
     r = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=timeout)
     r.raise_for_status()
     ctype = r.headers.get("Content-Type", "").lower()
-    return r.text if "text" in ctype or "html" in ctype or "xml" in ctype else r.content.decode("utf-8", errors="ignore"), ctype
+    if "text" in ctype or "html" in ctype or "xml" in ctype:
+        return r.text, ctype
+    return r.content.decode("utf-8", errors="ignore"), ctype
 
 
 def fetch_bytes_url(url: str, timeout: int = REQUEST_TIMEOUT) -> bytes:
@@ -308,40 +177,21 @@ def read_pdf_bytes(file_bytes: bytes) -> str:
         return ""
 
 
-def parse_datetime_loose(s: str) -> Optional[datetime]:
-    if not s:
-        return None
-    s = s.strip()
-    candidates = [
-        "%a, %d %b %Y %H:%M:%S %z",
-        "%Y-%m-%dT%H:%M:%S%z",
-        "%Y-%m-%dT%H:%M:%SZ",
-        "%Y-%m-%d %H:%M:%S",
-    ]
-    for fmt in candidates:
-        try:
-            dt = datetime.strptime(s, fmt)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            return dt
-        except Exception:
-            pass
-    return None
+def html_title(html: str, fallback: str = "") -> str:
+    soup = BeautifulSoup(html, "html.parser")
+    if soup.title and soup.title.string:
+        t = clean_text(soup.title.string)
+        if t:
+            return t
+    h1 = soup.find("h1")
+    if h1:
+        t = clean_text(h1.get_text(" ", strip=True))
+        if t:
+            return t
+    return fallback
 
 
-def estimate_cost_text(tokens_in: int, tokens_out: int, model_name: str) -> str:
-    price = {
-        "gpt-4o-mini": (0.15, 0.60),
-        "gpt-4o": (2.50, 10.00),
-    }
-    if model_name not in price:
-        return "est cost: n/a"
-    pin, pout = price[model_name]
-    usd = (tokens_in / 1_000_000.0) * pin + (tokens_out / 1_000_000.0) * pout
-    return f"est cost: ${usd:.6f}"
-
-
-def extract_lat_lon_from_text(text: str) -> Tuple[Optional[float], Optional[float]]:
+def extract_lat_lon_from_text(text: str):
     if not text:
         return None, None
     patterns = [
@@ -360,331 +210,55 @@ def extract_lat_lon_from_text(text: str) -> Tuple[Optional[float], Optional[floa
     return None, None
 
 
-def maybe_trim(text: str, n: int = 1200) -> str:
-    text = text or ""
-    return text[:n] + ("..." if len(text) > n else "")
+def get_openai_client():
+    if OpenAI is None:
+        raise RuntimeError("openai package is not installed.")
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY not set.")
+    return OpenAI(api_key=OPENAI_API_KEY)
 
 
 # =========================================================
-# DATA STRUCTURES
+# SIMPLE IN-MEMORY STORE
 # =========================================================
-@dataclass
-class PageRecord:
-    url: str
-    title: str
-    text: str
-    source_domain: str
-    fetched_at_utc: str
-    content_hash: str
-    source_type: str
+def add_docs(docs):
+    existing_keys = {(d["title"], d["url"], d["source_type"]) for d in st.session_state.doc_store}
+    added = 0
+    for doc in docs:
+        key = (doc["title"], doc["url"], doc["source_type"])
+        if key not in existing_keys:
+            st.session_state.doc_store.append(doc)
+            existing_keys.add(key)
+            added += 1
+    return added
 
 
-@dataclass
-class ChunkRecord:
-    chunk_id: str
-    url: str
-    title: str
-    source_domain: str
-    chunk_index: int
-    text: str
-    content_hash: str
-    fetched_at_utc: str
-    source_type: str
-
-
-# =========================================================
-# ROBOTS
-# =========================================================
-class RobotsManager:
-    def __init__(self, user_agent: str):
-        self.user_agent = user_agent
-        self.parsers: Dict[str, RobotFileParser] = {}
-        self.lock = threading.Lock()
-
-    def allowed(self, url: str) -> bool:
-        parsed = urlparse(url)
-        root = f"{parsed.scheme}://{parsed.netloc}"
-        with self.lock:
-            if root not in self.parsers:
-                rp = RobotFileParser()
-                rp.set_url(urljoin(root, "/robots.txt"))
-                try:
-                    rp.read()
-                except Exception:
-                    pass
-                self.parsers[root] = rp
-            rp = self.parsers[root]
-        try:
-            return rp.can_fetch(self.user_agent, url)
-        except Exception:
-            return True
-
-
-# =========================================================
-# CRAWLER
-# =========================================================
-class WildfireCrawler:
-    def __init__(
-        self,
-        seed_urls: List[str],
-        allowed_domains: List[str],
-        max_pages: int = 120,
-        max_depth: int = 2,
-        request_delay_sec: float = 0.5,
-        max_workers: int = 6,
-        user_agent: str = USER_AGENT,
-    ):
-        self.seed_urls = [normalize_url(u) for u in seed_urls if u.strip()]
-        self.allowed_domains = [d.strip() for d in allowed_domains if d.strip()]
-        self.max_pages = int(max_pages)
-        self.max_depth = int(max_depth)
-        self.request_delay_sec = float(request_delay_sec)
-        self.max_workers = int(max_workers)
-        self.user_agent = user_agent
-        self.headers = {"User-Agent": self.user_agent}
-        self.robots = RobotsManager(self.user_agent)
-        self.q = queue.Queue()
-        self.lock = threading.Lock()
-        self.visited = set()
-        self.page_records: List[PageRecord] = []
-        self.last_request_time = 0.0
-
-    def _rate_limit(self):
-        with self.lock:
-            now = time.time()
-            wait = self.request_delay_sec - (now - self.last_request_time)
-            if wait > 0:
-                time.sleep(wait)
-            self.last_request_time = time.time()
-
-    def _fetch_html(self, url: str) -> Optional[requests.Response]:
-        try:
-            self._rate_limit()
-            r = requests.get(url, headers=self.headers, timeout=REQUEST_TIMEOUT, allow_redirects=True)
-            ctype = r.headers.get("Content-Type", "").lower()
-            if r.status_code != 200:
-                return None
-            if "text/html" not in ctype:
-                return None
-            return r
-        except Exception:
-            return None
-
-    def _extract_main_text(self, html: str) -> str:
-        txt = trafilatura.extract(
-            html,
-            include_comments=False,
-            include_tables=False,
-            no_fallback=False,
-        )
-        if txt:
-            return clean_text(txt)
-        soup = BeautifulSoup(html, "html.parser")
-        for tag in soup(["script", "style", "noscript", "header", "footer", "nav", "aside"]):
-            tag.decompose()
-        return clean_text(soup.get_text("\n", strip=True))
-
-    def _worker(self):
-        while True:
-            try:
-                url, depth = self.q.get(timeout=1)
-            except queue.Empty:
-                return
-
-            try:
-                with self.lock:
-                    if url in self.visited or len(self.visited) >= self.max_pages:
-                        continue
-                    self.visited.add(url)
-
-                if not is_allowed_domain(url, self.allowed_domains):
-                    continue
-                if not looks_like_html_url(url):
-                    continue
-                if not self.robots.allowed(url):
-                    continue
-
-                resp = self._fetch_html(url)
-                if resp is None:
-                    continue
-
-                html = resp.text
-                text = self._extract_main_text(html)
-                title = html_title(html, fallback=url)
-
-                if len(text.split()) >= 80:
-                    self.page_records.append(
-                        PageRecord(
-                            url=url,
-                            title=title,
-                            text=text,
-                            source_domain=urlparse(url).netloc.lower(),
-                            fetched_at_utc=utc_now_iso(),
-                            content_hash=safe_hash(text),
-                            source_type="web",
-                        )
-                    )
-
-                if depth < self.max_depth:
-                    for link in extract_links(url, html):
-                        if is_allowed_domain(link, self.allowed_domains):
-                            with self.lock:
-                                if link not in self.visited and len(self.visited) < self.max_pages:
-                                    self.q.put((link, depth + 1))
-            finally:
-                self.q.task_done()
-
-    def crawl(self) -> List[PageRecord]:
-        for s in self.seed_urls:
-            self.q.put((s, 0))
-        threads = []
-        for _ in range(self.max_workers):
-            t = threading.Thread(target=self._worker, daemon=True)
-            t.start()
-            threads.append(t)
-        self.q.join()
-        for t in threads:
-            t.join(timeout=1)
-        return self.page_records
-
-
-# =========================================================
-# VECTOR STORE
-# =========================================================
-class WildfireKnowledgeBase:
-    def __init__(self, chroma_dir: str, collection_name: str, embed_model_name: str):
-        if chromadb is None or SentenceTransformer is None:
-            raise RuntimeError("Install chromadb and sentence-transformers.")
-        self.client = chromadb.PersistentClient(
-            path=chroma_dir,
-            settings=Settings(anonymized_telemetry=False)
-        )
-        self.collection = self.client.get_or_create_collection(name=collection_name)
-        self.embedder = SentenceTransformer(embed_model_name)
-
-    def page_to_chunks(self, page: PageRecord) -> List[ChunkRecord]:
-        chunks = split_into_word_chunks(page.text)
-        out = []
-        for i, c in enumerate(chunks):
-            cid = safe_hash(f"{page.url}|{page.content_hash}|{i}|{c[:120]}")
-            out.append(
-                ChunkRecord(
-                    chunk_id=cid,
-                    url=page.url,
-                    title=page.title,
-                    source_domain=page.source_domain,
-                    chunk_index=i,
-                    text=c,
-                    content_hash=page.content_hash,
-                    fetched_at_utc=page.fetched_at_utc,
-                    source_type=page.source_type,
-                )
-            )
-        return out
-
-    def upsert_pages(self, pages: List[PageRecord]) -> int:
-        chunks = []
-        for p in pages:
-            chunks.extend(self.page_to_chunks(p))
-        if not chunks:
-            return 0
-
-        ids = [c.chunk_id for c in chunks]
-        docs = [c.text for c in chunks]
-        metas = [{
-            "url": c.url,
-            "title": c.title,
-            "source_domain": c.source_domain,
-            "chunk_index": c.chunk_index,
-            "content_hash": c.content_hash,
-            "fetched_at_utc": c.fetched_at_utc,
-            "source_type": c.source_type,
-        } for c in chunks]
-
-        embeddings = self.embedder.encode(docs, show_progress_bar=False, normalize_embeddings=True).tolist()
-
-        self.collection.upsert(
-            ids=ids,
-            documents=docs,
-            metadatas=metas,
-            embeddings=embeddings,
-        )
-        return len(chunks)
-
-    def query(self, question: str, top_k: int = TOP_K) -> List[Dict]:
-        qemb = self.embedder.encode([question], normalize_embeddings=True).tolist()[0]
-        res = self.collection.query(
-            query_embeddings=[qemb],
-            n_results=top_k,
-            include=["documents", "metadatas", "distances"]
-        )
-        docs = res.get("documents", [[]])[0]
-        metas = res.get("metadatas", [[]])[0]
-        distances = res.get("distances", [[]])[0]
-        hits = []
-        for d, m, dist in zip(docs, metas, distances):
+def simple_search(query: str, top_k: int = 8):
+    query_terms = [t.lower() for t in re.findall(r"\w+", query) if len(t) > 2]
+    hits = []
+    for doc in st.session_state.doc_store:
+        text = f"{doc.get('title', '')}\n{doc.get('text', '')}".lower()
+        score = 0
+        for term in query_terms:
+            score += text.count(term)
+        if score > 0:
             hits.append({
-                "text": d,
-                "metadata": m,
-                "distance": float(dist) if dist is not None else None,
+                "score": score,
+                "title": doc.get("title", ""),
+                "url": doc.get("url", ""),
+                "source_type": doc.get("source_type", ""),
+                "source_domain": doc.get("source_domain", ""),
+                "text": doc.get("text", "")
             })
-        return hits
-
-    def peek(self, n: int = 40) -> List[Dict]:
-        try:
-            data = self.collection.get(limit=n, include=["documents", "metadatas"])
-            out = []
-            for d, m in zip(data.get("documents", []), data.get("metadatas", [])):
-                out.append({"text": d, "metadata": m})
-            return out
-        except Exception:
-            return []
-
-    def count(self) -> int:
-        try:
-            return self.collection.count()
-        except Exception:
-            return 0
-
-    def clear(self):
-        try:
-            self.client.delete_collection(COLLECTION_NAME)
-        except Exception:
-            pass
-        self.collection = self.client.get_or_create_collection(name=COLLECTION_NAME)
-
-
-@st.cache_resource(show_spinner=False)
-def get_kb():
-    return WildfireKnowledgeBase(
-        chroma_dir=CHROMA_DIR,
-        collection_name=COLLECTION_NAME,
-        embed_model_name=EMBED_MODEL_NAME,
-    )
+    hits = sorted(hits, key=lambda x: x["score"], reverse=True)
+    return hits[:top_k]
 
 
 # =========================================================
 # SOURCE INGESTORS
 # =========================================================
-def ingest_manual_text(title: str, text: str, source_type: str = "note") -> List[PageRecord]:
-    text = clean_text(text)
-    if len(text.split()) < 20:
-        return []
-    return [
-        PageRecord(
-            url=f"{source_type}://{safe_hash(title + text)[:12]}",
-            title=title.strip() or "Untitled",
-            text=text,
-            source_domain=source_type,
-            fetched_at_utc=utc_now_iso(),
-            content_hash=safe_hash(text),
-            source_type=source_type,
-        )
-    ]
-
-
-def ingest_uploaded_files(files) -> List[PageRecord]:
-    pages = []
+def ingest_uploaded_files(files):
+    docs = []
     for f in files or []:
         file_bytes = f.read()
         fname = f.name
@@ -704,33 +278,37 @@ def ingest_uploaded_files(files) -> List[PageRecord]:
             except Exception:
                 text = ""
 
-        if len(text.split()) < 30:
+        if len(text.split()) < 20:
             continue
 
-        pages.append(
-            PageRecord(
-                url=f"upload://{fname}",
-                title=fname,
-                text=text,
-                source_domain="uploaded-file",
-                fetched_at_utc=utc_now_iso(),
-                content_hash=safe_hash(text),
-                source_type="upload",
-            )
-        )
-    return pages
+        docs.append({
+            "title": fname,
+            "url": f"upload://{fname}",
+            "text": text,
+            "source_domain": "uploaded-file",
+            "source_type": "upload",
+            "fetched_at_utc": utc_now_iso(),
+        })
+    return docs
 
 
-def fetch_inciweb_incidents(rss_url: str = INCIWEB_RSS_URL, max_items: int = 30) -> List[Dict]:
+def ingest_manual_text(title: str, text: str, source_type: str = "note"):
+    text = clean_text(text)
+    if len(text.split()) < 20:
+        return []
+    return [{
+        "title": title.strip() or "Untitled",
+        "url": f"{source_type}://manual",
+        "text": text,
+        "source_domain": source_type,
+        "source_type": source_type,
+        "fetched_at_utc": utc_now_iso(),
+    }]
+
+
+def fetch_inciweb_incidents(rss_url: str = INCIWEB_RSS_URL, max_items: int = 30):
     xml_text, _ = fetch_text_url(rss_url)
     root = ET.fromstring(xml_text)
-
-    ns = {
-        "atom": "http://www.w3.org/2005/Atom",
-        "content": "http://purl.org/rss/1.0/modules/content/",
-        "dc": "http://purl.org/dc/elements/1.1/",
-        "georss": "http://www.georss.org/georss",
-    }
 
     items = []
     for item in root.findall(".//item")[:max_items]:
@@ -763,8 +341,8 @@ def fetch_inciweb_incidents(rss_url: str = INCIWEB_RSS_URL, max_items: int = 30)
     return items
 
 
-def incidents_to_pages(incidents: List[Dict]) -> List[PageRecord]:
-    pages = []
+def incidents_to_docs(incidents):
+    docs = []
     for x in incidents:
         text = clean_text(
             f"Incident Title: {x.get('title', '')}\n"
@@ -776,22 +354,19 @@ def incidents_to_pages(incidents: List[Dict]) -> List[PageRecord]:
         )
         if len(text.split()) < 20:
             continue
-        pages.append(
-            PageRecord(
-                url=x.get("link", "") or f"inciweb://{safe_hash(text)[:12]}",
-                title=x.get("title", "InciWeb Incident"),
-                text=text,
-                source_domain="inciweb.wildfire.gov",
-                fetched_at_utc=utc_now_iso(),
-                content_hash=safe_hash(text),
-                source_type="incident",
-            )
-        )
-    return pages
+        docs.append({
+            "title": x.get("title", "InciWeb Incident"),
+            "url": x.get("link", "") or "inciweb://incident",
+            "text": text,
+            "source_domain": "inciweb.wildfire.gov",
+            "source_type": "incident",
+            "fetched_at_utc": utc_now_iso(),
+        })
+    return docs
 
 
-def fetch_nifc_outlook_pages() -> List[PageRecord]:
-    pages = []
+def fetch_nifc_outlook_docs():
+    docs = []
     pdf_targets = [
         ("NIFC National Significant Wildland Fire Potential Outlook", NIFC_MONTHLY_OUTLOOK_PDF),
         ("NIFC North American Seasonal Fire Assessment and Outlook", NIFC_NA_OUTLOOK_PDF),
@@ -801,17 +376,14 @@ def fetch_nifc_outlook_pages() -> List[PageRecord]:
             pdf_bytes = fetch_bytes_url(url)
             text = read_pdf_bytes(pdf_bytes)
             if len(text.split()) >= 40:
-                pages.append(
-                    PageRecord(
-                        url=url,
-                        title=title,
-                        text=text,
-                        source_domain="nifc.gov",
-                        fetched_at_utc=utc_now_iso(),
-                        content_hash=safe_hash(text),
-                        source_type="outlook",
-                    )
-                )
+                docs.append({
+                    "title": title,
+                    "url": url,
+                    "text": text,
+                    "source_domain": "nifc.gov",
+                    "source_type": "outlook",
+                    "fetched_at_utc": utc_now_iso(),
+                })
         except Exception:
             pass
 
@@ -820,29 +392,25 @@ def fetch_nifc_outlook_pages() -> List[PageRecord]:
         txt = trafilatura.extract(html, include_comments=False, include_tables=False, no_fallback=False) or ""
         txt = clean_text(txt)
         if len(txt.split()) >= 40:
-            pages.append(
-                PageRecord(
-                    url=NIFC_WEATHER_PAGE,
-                    title="NIFC Predictive Services Weather",
-                    text=txt,
-                    source_domain="nifc.gov",
-                    fetched_at_utc=utc_now_iso(),
-                    content_hash=safe_hash(txt),
-                    source_type="predictive-services",
-                )
-            )
+            docs.append({
+                "title": "NIFC Predictive Services Weather",
+                "url": NIFC_WEATHER_PAGE,
+                "text": txt,
+                "source_domain": "nifc.gov",
+                "source_type": "predictive-services",
+                "fetched_at_utc": utc_now_iso(),
+            })
     except Exception:
         pass
 
-    return pages
+    return docs
 
 
-def scrape_fire_weather_page(url: str) -> Optional[PageRecord]:
+def scrape_fire_weather_page(url: str):
     try:
         html, _ = fetch_text_url(url)
         title = html_title(html, fallback=url)
         soup = BeautifulSoup(html, "html.parser")
-
         candidates = []
 
         for tag in soup.find_all(["h1", "h2", "h3", "p", "li", "pre", "div"]):
@@ -865,42 +433,45 @@ def scrape_fire_weather_page(url: str) -> Optional[PageRecord]:
         if len(text.split()) < 40:
             return None
 
-        return PageRecord(
-            url=url,
-            title=title,
-            text=text,
-            source_domain=urlparse(url).netloc.lower(),
-            fetched_at_utc=utc_now_iso(),
-            content_hash=safe_hash(text),
-            source_type="fire-weather",
-        )
+        return {
+            "title": title,
+            "url": url,
+            "text": text,
+            "source_domain": urlparse(url).netloc.lower(),
+            "source_type": "fire-weather",
+            "fetched_at_utc": utc_now_iso(),
+        }
     except Exception:
         return None
 
 
-def fetch_fire_weather_pages(urls: List[str]) -> List[PageRecord]:
-    pages = []
+def fetch_fire_weather_docs(urls):
+    docs = []
     for u in urls:
         rec = scrape_fire_weather_page(u)
         if rec:
-            pages.append(rec)
-    return pages
+            docs.append(rec)
+    return docs
 
 
-def fetch_nws_alerts_for_bbox_or_area(area: str = "") -> List[Dict]:
+def fetch_nws_alerts_for_area(area: str = ""):
     base = "https://api.weather.gov/alerts/active"
     params = {}
     if area.strip():
         params["area"] = area.strip().upper()
     try:
-        r = requests.get(base, headers={"User-Agent": USER_AGENT, "Accept": "application/geo+json"}, params=params, timeout=REQUEST_TIMEOUT)
+        r = requests.get(
+            base,
+            headers={"User-Agent": USER_AGENT, "Accept": "application/geo+json"},
+            params=params,
+            timeout=REQUEST_TIMEOUT
+        )
         r.raise_for_status()
         js = r.json()
         feats = js.get("features", [])
         out = []
         for f in feats:
             prop = f.get("properties", {})
-            geom = f.get("geometry", {})
             event = prop.get("event", "")
             if "fire" in event.lower():
                 out.append({
@@ -911,17 +482,15 @@ def fetch_nws_alerts_for_bbox_or_area(area: str = "") -> List[Dict]:
                     "sent": prop.get("sent", ""),
                     "description": prop.get("description", ""),
                     "instruction": prop.get("instruction", ""),
-                    "response": prop.get("response", ""),
                     "url": prop.get("@id", ""),
-                    "geometry": geom,
                 })
         return out
     except Exception:
         return []
 
 
-def alerts_to_pages(alerts: List[Dict]) -> List[PageRecord]:
-    pages = []
+def alerts_to_docs(alerts):
+    docs = []
     for a in alerts:
         text = clean_text(
             f"Event: {a.get('event', '')}\n"
@@ -934,42 +503,30 @@ def alerts_to_pages(alerts: List[Dict]) -> List[PageRecord]:
         )
         if len(text.split()) < 15:
             continue
-        pages.append(
-            PageRecord(
-                url=a.get("url", "") or f"nws-alert://{safe_hash(text)[:12]}",
-                title=a.get("headline", "") or a.get("event", "NWS Fire Alert"),
-                text=text,
-                source_domain="api.weather.gov",
-                fetched_at_utc=utc_now_iso(),
-                content_hash=safe_hash(text),
-                source_type="alert",
-            )
-        )
-    return pages
+        docs.append({
+            "title": a.get("headline", "") or a.get("event", "NWS Fire Alert"),
+            "url": a.get("url", "") or "nws-alert://alert",
+            "text": text,
+            "source_domain": "api.weather.gov",
+            "source_type": "alert",
+            "fetched_at_utc": utc_now_iso(),
+        })
+    return docs
 
 
 # =========================================================
 # LLM
 # =========================================================
-def get_openai_client():
-    if OpenAI is None:
-        raise RuntimeError("openai package not installed.")
-    if not OPENAI_API_KEY:
-        raise RuntimeError("OPENAI_API_KEY not set.")
-    return OpenAI(api_key=OPENAI_API_KEY)
-
-
-def build_grounded_prompt(question: str, hits: List[Dict]) -> Tuple[str, str]:
+def build_grounded_prompt(question: str, hits):
     blocks = []
     for i, h in enumerate(hits, start=1):
-        md = h["metadata"]
         blocks.append(
             f"[Source {i}]\n"
-            f"Title: {md.get('title', '')}\n"
-            f"Type: {md.get('source_type', '')}\n"
-            f"URL: {md.get('url', '')}\n"
-            f"Domain: {md.get('source_domain', '')}\n"
-            f"Excerpt:\n{h.get('text', '')}\n"
+            f"Title: {h.get('title', '')}\n"
+            f"Type: {h.get('source_type', '')}\n"
+            f"URL: {h.get('url', '')}\n"
+            f"Domain: {h.get('source_domain', '')}\n"
+            f"Excerpt:\n{maybe_trim(h.get('text', ''), 2000)}\n"
         )
     system_prompt = (
         "You are a wildfire knowledge analyst. Use only the provided sources. "
@@ -979,7 +536,7 @@ def build_grounded_prompt(question: str, hits: List[Dict]) -> Tuple[str, str]:
     return system_prompt, user_prompt
 
 
-def answer_question_with_openai(question: str, hits: List[Dict]) -> Tuple[str, str]:
+def answer_question_with_openai(question: str, hits):
     client = get_openai_client()
     system_prompt, user_prompt = build_grounded_prompt(question, hits)
 
@@ -991,123 +548,67 @@ def answer_question_with_openai(question: str, hits: List[Dict]) -> Tuple[str, s
             {"role": "user", "content": user_prompt},
         ],
     )
-
-    answer = resp.choices[0].message.content.strip()
-    usage = getattr(resp, "usage", None)
-    pt = getattr(usage, "prompt_tokens", 0) if usage else 0
-    ct = getattr(usage, "completion_tokens", 0) if usage else 0
-    return answer, f"model={OPENAI_MODEL} | prompt={pt} | completion={ct} | {estimate_cost_text(pt, ct, OPENAI_MODEL)}"
+    return resp.choices[0].message.content.strip()
 
 
-def answer_question_local(question: str, hits: List[Dict]) -> Tuple[str, str]:
+def answer_question_local(question: str, hits):
     if not hits:
-        return "No indexed wildfire sources are available yet. Ingest incidents, outlooks, weather pages, or web content first.", "local fallback"
+        return "No indexed wildfire sources are available yet. Ingest incidents, outlooks, weather pages, alerts, or uploads first."
     lines = [f"Question: {question}", "", "Top retrieved sources:", ""]
     for i, h in enumerate(hits, start=1):
-        md = h["metadata"]
-        lines.append(f"{i}. {md.get('title', '')} | {md.get('source_type', '')} | {md.get('url', '')}")
-        lines.append(maybe_trim(h["text"], 900))
+        lines.append(f"{i}. {h.get('title', '')} | {h.get('source_type', '')} | {h.get('url', '')}")
+        lines.append(maybe_trim(h.get("text", ""), 800))
         lines.append("")
     lines.append("This is retrieval-only output because no OpenAI key was available.")
-    return "\n".join(lines), "local fallback"
+    return "\n".join(lines)
 
 
-def build_daily_briefing_prompt(
-    mode: str,
-    incidents: List[Dict],
-    outlook_pages: List[PageRecord],
-    weather_pages: List[PageRecord],
-    alert_pages: List[PageRecord],
-    hits: List[Dict],
-) -> Tuple[str, str]:
+def generate_daily_briefing(mode: str, incidents, outlook_docs, weather_docs, alert_docs, hits):
+    if not OPENAI_API_KEY or OpenAI is None:
+        return (
+            f"Daily briefing mode: {mode}\n\n"
+            f"Incidents loaded: {len(incidents)}\n"
+            f"Outlook docs loaded: {len(outlook_docs)}\n"
+            f"Weather docs loaded: {len(weather_docs)}\n"
+            f"Fire alert docs loaded: {len(alert_docs)}\n"
+            f"Retrieved context docs: {len(hits)}\n\n"
+            "OpenAI key was not available, so this is only a raw status summary."
+        )
+
+    client = get_openai_client()
+
     incident_text = []
-    for i, inc in enumerate(incidents[:15], start=1):
+    for i, inc in enumerate(incidents[:12], start=1):
         incident_text.append(
             f"[Incident {i}] {inc.get('title', '')}\n"
             f"Published: {inc.get('pub_date', '')}\n"
-            f"Link: {inc.get('link', '')}\n"
             f"Lat/Lon: {inc.get('lat', '')}, {inc.get('lon', '')}\n"
-            f"Summary: {maybe_trim(inc.get('description', ''), 1000)}"
+            f"Summary: {maybe_trim(inc.get('description', ''), 900)}"
         )
 
-    outlook_text = []
-    for p in outlook_pages[:6]:
-        outlook_text.append(f"[Outlook] {p.title}\nURL: {p.url}\n{maybe_trim(p.text, 1800)}")
-
-    weather_text = []
-    for p in weather_pages[:8]:
-        weather_text.append(f"[Fire Weather] {p.title}\nURL: {p.url}\n{maybe_trim(p.text, 1400)}")
-
-    alert_text = []
-    for p in alert_pages[:8]:
-        alert_text.append(f"[Alert] {p.title}\nURL: {p.url}\n{maybe_trim(p.text, 900)}")
-
-    retrieval_text = []
-    for i, h in enumerate(hits[:8], start=1):
-        md = h["metadata"]
-        retrieval_text.append(
-            f"[Retrieved {i}] {md.get('title', '')}\n"
-            f"Type: {md.get('source_type', '')}\n"
-            f"URL: {md.get('url', '')}\n"
-            f"{maybe_trim(h.get('text', ''), 1200)}"
-        )
-
-    mode_instructions = {
-        "operations": (
-            "Write a concise daily operations briefing. Focus on incident awareness, outlook signals, fire weather concerns, "
-            "decision-relevant hazards, and actionable watch items. Use a command-brief style with clear sections."
-        ),
-        "research": (
-            "Write a concise daily research briefing. Focus on patterns across incidents, recurring language in outlooks and weather, "
-            "data signals, and hypotheses worth tracking. Use a research-synthesis style with structured observations."
-        ),
-    }
+    outlook_text = [f"[Outlook] {d['title']}\n{maybe_trim(d['text'], 1600)}" for d in outlook_docs[:4]]
+    weather_text = [f"[Weather] {d['title']}\n{maybe_trim(d['text'], 1200)}" for d in weather_docs[:6]]
+    alert_text = [f"[Alert] {d['title']}\n{maybe_trim(d['text'], 800)}" for d in alert_docs[:6]]
+    retrieval_text = [f"[Retrieved] {h['title']}\n{maybe_trim(h['text'], 1000)}" for h in hits[:6]]
 
     system_prompt = (
         "You are a wildfire analyst building a daily intelligence briefing from provided incident, outlook, weather, alert, and retrieved knowledge inputs. "
         "Only use the provided material. Be concrete and structured."
     )
-
     user_prompt = (
-        f"Mode: {mode}\n"
-        f"Instruction: {mode_instructions.get(mode, mode_instructions['operations'])}\n\n"
-        f"Incidents:\n\n" + "\n\n".join(incident_text) + "\n\n"
-        f"Outlooks:\n\n" + "\n\n".join(outlook_text) + "\n\n"
-        f"Fire weather pages:\n\n" + "\n\n".join(weather_text) + "\n\n"
-        f"Active fire-related alerts:\n\n" + "\n\n".join(alert_text) + "\n\n"
-        f"Retrieved knowledge context:\n\n" + "\n\n".join(retrieval_text) + "\n\n"
-        "Output sections:\n"
+        f"Mode: {mode}\n\n"
+        "Write a concise daily briefing with these sections:\n"
         "1. Executive Summary\n"
         "2. Incident Picture\n"
         "3. Weather and Outlook Signals\n"
-        "4. Operational or Research Watch Items\n"
-        "5. Source Notes\n"
+        "4. Watch Items\n"
+        "5. Source Notes\n\n"
+        "Incidents:\n\n" + "\n\n".join(incident_text) + "\n\n"
+        "Outlooks:\n\n" + "\n\n".join(outlook_text) + "\n\n"
+        "Weather:\n\n" + "\n\n".join(weather_text) + "\n\n"
+        "Alerts:\n\n" + "\n\n".join(alert_text) + "\n\n"
+        "Retrieved context:\n\n" + "\n\n".join(retrieval_text)
     )
-    return system_prompt, user_prompt
-
-
-def generate_daily_briefing(
-    mode: str,
-    incidents: List[Dict],
-    outlook_pages: List[PageRecord],
-    weather_pages: List[PageRecord],
-    alert_pages: List[PageRecord],
-    hits: List[Dict],
-) -> Tuple[str, str]:
-    if not OPENAI_API_KEY or OpenAI is None:
-        text = (
-            f"Daily briefing mode: {mode}\n\n"
-            f"Incidents loaded: {len(incidents)}\n"
-            f"Outlook pages loaded: {len(outlook_pages)}\n"
-            f"Fire weather pages loaded: {len(weather_pages)}\n"
-            f"Fire-related alerts loaded: {len(alert_pages)}\n"
-            f"Retrieved context chunks: {len(hits)}\n\n"
-            "OpenAI key was not available, so this is only a raw status summary."
-        )
-        return text, "local fallback"
-
-    client = get_openai_client()
-    system_prompt, user_prompt = build_daily_briefing_prompt(mode, incidents, outlook_pages, weather_pages, alert_pages, hits)
 
     resp = client.chat.completions.create(
         model=OPENAI_MODEL,
@@ -1117,78 +618,7 @@ def generate_daily_briefing(
             {"role": "user", "content": user_prompt},
         ],
     )
-    text = resp.choices[0].message.content.strip()
-    usage = getattr(resp, "usage", None)
-    pt = getattr(usage, "prompt_tokens", 0) if usage else 0
-    ct = getattr(usage, "completion_tokens", 0) if usage else 0
-    return text, f"model={OPENAI_MODEL} | prompt={pt} | completion={ct} | {estimate_cost_text(pt, ct, OPENAI_MODEL)}"
-
-
-# =========================================================
-# MAP HELPERS
-# =========================================================
-def incidents_to_df(incidents: List[Dict]) -> pd.DataFrame:
-    rows = []
-    for x in incidents:
-        lat = x.get("lat")
-        lon = x.get("lon")
-        if lat is None or lon is None:
-            continue
-        rows.append({
-            "title": x.get("title", ""),
-            "link": x.get("link", ""),
-            "pub_date": x.get("pub_date", ""),
-            "description": maybe_trim(x.get("description", ""), 300),
-            "lat": lat,
-            "lon": lon,
-            "kind": "incident",
-        })
-    return pd.DataFrame(rows)
-
-
-def build_map_df(incidents: List[Dict]) -> pd.DataFrame:
-    df = incidents_to_df(incidents)
-    return df if not df.empty else pd.DataFrame(columns=["title", "link", "pub_date", "description", "lat", "lon", "kind"])
-
-
-def render_pydeck_map(df: pd.DataFrame):
-    if pdk is None:
-        st.info("pydeck is not installed. Install it to enable the map.")
-        return
-    if df.empty:
-        st.info("No incident points were found in the current feed.")
-        return
-
-    view_state = pdk.ViewState(
-        latitude=float(df["lat"].mean()),
-        longitude=float(df["lon"].mean()),
-        zoom=4,
-        pitch=30,
-    )
-
-    layer = pdk.Layer(
-        "ScatterplotLayer",
-        data=df,
-        get_position="[lon, lat]",
-        get_radius=18000,
-        get_fill_color="[239, 68, 68, 180]",
-        get_line_color="[255,255,255,180]",
-        line_width_min_pixels=1,
-        pickable=True,
-    )
-
-    tooltip = {
-        "html": "<b>{title}</b><br/>{pub_date}<br/>{description}",
-        "style": {"backgroundColor": "rgba(30,30,30,0.95)", "color": "white"}
-    }
-
-    deck = pdk.Deck(
-        layers=[layer],
-        initial_view_state=view_state,
-        map_style="mapbox://styles/mapbox/dark-v11",
-        tooltip=tooltip,
-    )
-    st.pydeck_chart(deck, use_container_width=True)
+    return resp.choices[0].message.content.strip()
 
 
 # =========================================================
@@ -1202,27 +632,20 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 m1, m2, m3, m4 = st.columns(4)
-m1.markdown(f'<div class="metric-card"><div style="font-size:0.85rem; opacity:0.7;">Vector DB</div><div style="font-size:1.15rem; font-weight:800;">{COLLECTION_NAME}</div></div>', unsafe_allow_html=True)
-m2.markdown(f'<div class="metric-card"><div style="font-size:0.85rem; opacity:0.7;">Embedding model</div><div style="font-size:1rem; font-weight:800;">{EMBED_MODEL_NAME}</div></div>', unsafe_allow_html=True)
-m3.markdown(f'<div class="metric-card"><div style="font-size:0.85rem; opacity:0.7;">LLM</div><div style="font-size:1.15rem; font-weight:800;">{OPENAI_MODEL}</div></div>', unsafe_allow_html=True)
-m4.markdown(f'<div class="metric-card"><div style="font-size:0.85rem; opacity:0.7;">OpenAI key</div><div style="font-size:1.15rem; font-weight:800;">{"set" if OPENAI_API_KEY else "not set"}</div></div>', unsafe_allow_html=True)
+m1.markdown(f'<div class="metric-card"><div style="font-size:0.85rem; opacity:0.7;">Stored docs</div><div style="font-size:1.15rem; font-weight:800;">{len(st.session_state.doc_store)}</div></div>', unsafe_allow_html=True)
+m2.markdown(f'<div class="metric-card"><div style="font-size:0.85rem; opacity:0.7;">LLM</div><div style="font-size:1.15rem; font-weight:800;">{OPENAI_MODEL}</div></div>', unsafe_allow_html=True)
+m3.markdown(f'<div class="metric-card"><div style="font-size:0.85rem; opacity:0.7;">OpenAI key</div><div style="font-size:1.15rem; font-weight:800;">{"set" if OPENAI_API_KEY else "not set"}</div></div>', unsafe_allow_html=True)
+m4.markdown(f'<div class="metric-card"><div style="font-size:0.85rem; opacity:0.7;">Time</div><div style="font-size:1.15rem; font-weight:800;">{datetime.now().strftime("%Y-%m-%d %H:%M")}</div></div>', unsafe_allow_html=True)
 
 st.divider()
 
-tabs = st.tabs(["Daily Briefing", "Incidents + Map", "Ask", "Ingest", "Library", "Settings"])
+tabs = st.tabs(["Daily Briefing", "Incidents", "Ask", "Ingest", "Library", "Settings"])
 
 
 # =========================================================
 # DAILY BRIEFING TAB
 # =========================================================
 with tabs[0]:
-    kb_ok = True
-    try:
-        kb = get_kb()
-    except Exception as e:
-        kb_ok = False
-        st.error(f"Knowledge base init failed: {e}")
-
     c1, c2 = st.columns([1.2, 1])
 
     with c1:
@@ -1244,49 +667,43 @@ with tabs[0]:
     st.markdown("</div>", unsafe_allow_html=True)
 
     if run_briefing:
-        if not kb_ok:
-            st.stop()
-
         with st.spinner("Pulling incident feed..."):
             incidents = fetch_inciweb_incidents()
 
         with st.spinner("Pulling outlooks and predictive services..."):
-            outlook_pages = fetch_nifc_outlook_pages()
+            outlook_docs = fetch_nifc_outlook_docs()
 
         with st.spinner("Pulling fire weather pages..."):
-            weather_pages = fetch_fire_weather_pages(DEFAULT_FIRE_WEATHER_URLS)
+            weather_docs = fetch_fire_weather_docs(DEFAULT_FIRE_WEATHER_URLS)
 
         with st.spinner("Pulling fire-related alerts..."):
-            alerts = fetch_nws_alerts_for_bbox_or_area(alert_area)
-            alert_pages = alerts_to_pages(alerts)
+            alerts = fetch_nws_alerts_for_area(alert_area)
+            alert_docs = alerts_to_docs(alerts)
 
-        with st.spinner("Retrieving indexed context..."):
-            hits = kb.query(f"{briefing_focus}\n\n{retrieve_query}", top_k=8) if kb_ok else []
+        with st.spinner("Retrieving stored context..."):
+            hits = simple_search(f"{briefing_focus}\n{retrieve_query}", top_k=8)
 
         with st.spinner("Generating briefing..."):
-            briefing, usage = generate_daily_briefing(
+            briefing = generate_daily_briefing(
                 mode=briefing_mode,
                 incidents=incidents,
-                outlook_pages=outlook_pages,
-                weather_pages=weather_pages,
-                alert_pages=alert_pages,
+                outlook_docs=outlook_docs,
+                weather_docs=weather_docs,
+                alert_docs=alert_docs,
                 hits=hits,
             )
 
         st.session_state.last_briefing = briefing
         st.session_state.last_incidents = incidents
-        st.session_state.last_map_df = build_map_df(incidents)
 
         st.markdown("### Daily briefing")
         st.write(briefing)
-        st.caption(usage)
 
-        st.markdown("### Quick status")
         q1, q2, q3, q4 = st.columns(4)
         q1.metric("Incidents", f"{len(incidents):,}")
-        q2.metric("Outlook pages", f"{len(outlook_pages):,}")
-        q3.metric("Weather pages", f"{len(weather_pages):,}")
-        q4.metric("Fire alerts", f"{len(alert_pages):,}")
+        q2.metric("Outlook docs", f"{len(outlook_docs):,}")
+        q3.metric("Weather docs", f"{len(weather_docs):,}")
+        q4.metric("Fire alerts", f"{len(alert_docs):,}")
 
     elif st.session_state.last_briefing:
         st.markdown("### Last briefing")
@@ -1294,26 +711,40 @@ with tabs[0]:
 
 
 # =========================================================
-# INCIDENTS + MAP TAB
+# INCIDENTS TAB
 # =========================================================
 with tabs[1]:
-    left, right = st.columns([1.05, 1])
+    max_incidents = st.slider("Incident count", 5, 50, 20, 1)
 
-    with left:
-        max_incidents = st.slider("Incident count", 5, 50, 20, 1)
-        st.markdown('<div class="big-button">', unsafe_allow_html=True)
-        run_incidents = st.button("REFRESH INCIDENT FEED", use_container_width=True, type="primary")
-        st.markdown("</div>", unsafe_allow_html=True)
+    st.markdown('<div class="big-button">', unsafe_allow_html=True)
+    run_incidents = st.button("REFRESH INCIDENT FEED", use_container_width=True, type="primary")
+    st.markdown("</div>", unsafe_allow_html=True)
 
-        if run_incidents or not st.session_state.last_incidents:
-            with st.spinner("Loading InciWeb incidents..."):
-                try:
-                    st.session_state.last_incidents = fetch_inciweb_incidents(max_items=max_incidents)
-                    st.session_state.last_map_df = build_map_df(st.session_state.last_incidents)
-                except Exception as e:
-                    st.error(f"Failed to load incidents: {e}")
+    if run_incidents or not st.session_state.last_incidents:
+        with st.spinner("Loading InciWeb incidents..."):
+            try:
+                st.session_state.last_incidents = fetch_inciweb_incidents(max_items=max_incidents)
+            except Exception as e:
+                st.error(f"Failed to load incidents: {e}")
 
-        incidents = st.session_state.last_incidents[:max_incidents]
+    incidents = st.session_state.last_incidents[:max_incidents]
+
+    if incidents:
+        rows = []
+        for inc in incidents:
+            rows.append({
+                "title": inc.get("title", ""),
+                "pub_date": inc.get("pub_date", ""),
+                "lat": inc.get("lat"),
+                "lon": inc.get("lon"),
+                "link": inc.get("link", ""),
+            })
+
+        map_rows = [r for r in rows if r["lat"] is not None and r["lon"] is not None]
+        if map_rows:
+            st.markdown("### Incident map")
+            map_df = pd.DataFrame(map_rows).rename(columns={"lat": "latitude", "lon": "longitude"})
+            st.map(map_df[["latitude", "longitude"]], use_container_width=True)
 
         st.markdown("### Incident cards")
         for inc in incidents:
@@ -1335,84 +766,63 @@ with tabs[1]:
                 unsafe_allow_html=True,
             )
 
-    with right:
-        st.markdown("### Incident map")
-        render_pydeck_map(st.session_state.last_map_df)
-
-        if not st.session_state.last_map_df.empty:
-            st.markdown("### Incident table")
-            st.dataframe(
-                st.session_state.last_map_df[["title", "pub_date", "lat", "lon", "link"]],
-                use_container_width=True,
-                hide_index=True,
-            )
+        st.markdown("### Incident table")
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    else:
+        st.info("No incidents loaded yet.")
 
 
 # =========================================================
 # ASK TAB
 # =========================================================
 with tabs[2]:
-    kb_ok = True
-    try:
-        kb = get_kb()
-    except Exception as e:
-        kb_ok = False
-        st.error(f"Knowledge base init failed: {e}")
-
     a1, a2 = st.columns([1.4, 1])
 
     with a1:
         question = st.text_area(
             "Ask a wildfire question",
-            value="What are the key themes across the indexed wildfire incident, outlook, weather, and policy sources?",
+            value="What are the key themes across the stored wildfire incident, outlook, weather, and policy sources?",
             height=150,
         )
         top_k = st.slider("Retrieved source count", 3, 12, 8, 1)
         st.markdown('<div class="big-button">', unsafe_allow_html=True)
-        run_ask = st.button("ASK THE FIRE BRAIN", use_container_width=True, type="primary")
+        run_ask = st.button("ASK", use_container_width=True, type="primary")
         st.markdown("</div>", unsafe_allow_html=True)
 
     with a2:
-        chunk_count = kb.count() if kb_ok else 0
-        st.metric("Indexed chunks", f"{chunk_count:,}")
-        st.metric("Recent pages", f"{st.session_state.latest_stats.get('pages', 0):,}")
-        st.metric("Recent chunks", f"{st.session_state.latest_stats.get('chunks', 0):,}")
-        st.metric("Recent sources", f"{st.session_state.latest_stats.get('sources', 0):,}")
+        st.metric("Stored docs", f"{len(st.session_state.doc_store):,}")
+        type_counts = pd.Series([d["source_type"] for d in st.session_state.doc_store]).value_counts().to_dict() if st.session_state.doc_store else {}
+        st.write(type_counts)
 
     if run_ask:
-        if not kb_ok:
-            st.stop()
-
-        with st.spinner("Searching indexed wildfire knowledge..."):
-            hits = kb.query(question, top_k=top_k)
+        with st.spinner("Searching stored wildfire knowledge..."):
+            hits = simple_search(question, top_k=top_k)
             st.session_state.last_hits = hits
 
         with st.spinner("Building grounded answer..."):
             try:
                 if OPENAI_API_KEY and OpenAI is not None:
-                    answer, usage = answer_question_with_openai(question, hits)
+                    answer = answer_question_with_openai(question, hits)
                 else:
-                    answer, usage = answer_question_local(question, hits)
+                    answer = answer_question_local(question, hits)
             except Exception as e:
-                answer, usage = answer_question_local(question, hits)
+                answer = answer_question_local(question, hits)
                 answer += f"\n\nOpenAI call failed and the app fell back to retrieval-only output.\nError: {e}"
 
         st.session_state.last_answer = answer
 
         st.markdown("### Answer")
         st.write(answer)
-        st.caption(usage)
 
         st.markdown("### Retrieved sources")
         for i, h in enumerate(hits, start=1):
-            md = h["metadata"]
             st.markdown(
                 f"""
                 <div class="source-card">
-                    <div style="font-size:1rem; font-weight:800;">[{i}] {md.get("title", "Untitled")}</div>
+                    <div style="font-size:1rem; font-weight:800;">[{i}] {h.get("title", "Untitled")}</div>
                     <div style="font-size:0.86rem; opacity:0.72; margin-bottom:0.45rem;">
-                        {md.get("source_type", "")} &nbsp;|&nbsp; {md.get("source_domain", "")} &nbsp;|&nbsp;
-                        <a href="{md.get("url", "")}" target="_blank">{md.get("url", "")}</a>
+                        {h.get("source_type", "")} &nbsp;|&nbsp; {h.get("source_domain", "")} &nbsp;|&nbsp;
+                        <a href="{h.get("url", "")}" target="_blank">{h.get("url", "")}</a>
                     </div>
                     <div style="font-size:0.95rem; line-height:1.45;">{maybe_trim(h.get("text", ""), 900)}</div>
                 </div>
@@ -1429,36 +839,22 @@ with tabs[2]:
 # INGEST TAB
 # =========================================================
 with tabs[3]:
-    kb_ok = True
-    try:
-        kb = get_kb()
-    except Exception as e:
-        kb_ok = False
-        st.error(f"Knowledge base init failed: {e}")
+    st.markdown("### Ingest wildfire sources")
 
-    st.markdown("### Smart ingestion")
     i1, i2 = st.columns([1.1, 1])
 
     with i1:
-        seed_text = st.text_area("Seed URLs", value="\n".join(DEFAULT_SEEDS), height=160)
-        domains_text = st.text_area("Allowed domains", value="\n".join(DEFAULT_ALLOWED_DOMAINS), height=140)
         fire_weather_urls_text = st.text_area("Fire weather page URLs", value="\n".join(DEFAULT_FIRE_WEATHER_URLS), height=120)
 
     with i2:
-        max_pages = st.number_input("Max pages", min_value=10, max_value=5000, value=120, step=10)
-        max_depth = st.number_input("Max crawl depth", min_value=0, max_value=6, value=2, step=1)
-        max_workers = st.number_input("Workers", min_value=1, max_value=24, value=6, step=1)
-        request_delay = st.number_input("Delay between requests (sec)", min_value=0.0, max_value=5.0, value=0.5, step=0.1)
         alert_area = st.text_input("Alert area code for fire-related NWS alerts", value="CO")
 
-    b1, b2, b3, b4 = st.columns(4)
+    b1, b2, b3 = st.columns(3)
     with b1:
-        run_crawl = st.button("CRAWL WEB", use_container_width=True)
-    with b2:
         run_incident_ingest = st.button("INGEST INCIDENTS", use_container_width=True)
-    with b3:
+    with b2:
         run_outlook_ingest = st.button("INGEST OUTLOOKS", use_container_width=True)
-    with b4:
+    with b3:
         run_weather_ingest = st.button("INGEST WEATHER + ALERTS", use_container_width=True)
 
     st.divider()
@@ -1478,68 +874,49 @@ with tabs[3]:
         manual_text = st.text_area("Paste note text", value="", height=180)
         run_note_ingest = st.button("INGEST NOTE", use_container_width=True)
 
-    def finalize_ingest(pages: List[PageRecord], label: str):
-        if not kb_ok:
-            st.stop()
-        added_chunks = kb.upsert_pages(pages) if pages else 0
-        unique_sources = len({p.url for p in pages})
-        st.session_state.latest_stats = {"pages": len(pages), "chunks": added_chunks, "sources": unique_sources}
-        st.session_state.latest_docs_preview = [asdict(p) for p in pages[:20]]
-        st.session_state.ingest_log.append(
-            f"{utc_now_iso()} | {label} | pages={len(pages)} | chunks={added_chunks} | sources={unique_sources}"
-        )
-        if pages:
-            st.success(f"Ingested {len(pages)} pages into {added_chunks} chunks.")
-        else:
-            st.warning("No usable text was found.")
-
-    if run_crawl and kb_ok:
-        with st.spinner("Crawling wildfire web sources..."):
-            crawler = WildfireCrawler(
-                seed_urls=[x.strip() for x in seed_text.splitlines() if x.strip()],
-                allowed_domains=[x.strip() for x in domains_text.splitlines() if x.strip()],
-                max_pages=max_pages,
-                max_depth=max_depth,
-                request_delay_sec=request_delay,
-                max_workers=max_workers,
-            )
-            pages = crawler.crawl()
-        finalize_ingest(pages, "crawl")
-
-    if run_incident_ingest and kb_ok:
-        with st.spinner("Fetching and indexing incidents..."):
+    if run_incident_ingest:
+        with st.spinner("Fetching and storing incidents..."):
             incidents = fetch_inciweb_incidents(max_items=40)
             st.session_state.last_incidents = incidents
-            st.session_state.last_map_df = build_map_df(incidents)
-            pages = incidents_to_pages(incidents)
-        finalize_ingest(pages, "incidents")
+            docs = incidents_to_docs(incidents)
+            added = add_docs(docs)
+            st.session_state.ingest_log.append(f"{utc_now_iso()} | incidents | docs={added}")
+            st.success(f"Added {added} incident docs.")
 
-    if run_outlook_ingest and kb_ok:
-        with st.spinner("Fetching and indexing outlooks..."):
-            pages = fetch_nifc_outlook_pages()
-        finalize_ingest(pages, "outlooks")
+    if run_outlook_ingest:
+        with st.spinner("Fetching and storing outlooks..."):
+            docs = fetch_nifc_outlook_docs()
+            added = add_docs(docs)
+            st.session_state.ingest_log.append(f"{utc_now_iso()} | outlooks | docs={added}")
+            st.success(f"Added {added} outlook docs.")
 
-    if run_weather_ingest and kb_ok:
-        with st.spinner("Fetching and indexing fire weather pages and alerts..."):
-            fw_pages = fetch_fire_weather_pages([x.strip() for x in fire_weather_urls_text.splitlines() if x.strip()])
-            alerts = fetch_nws_alerts_for_bbox_or_area(alert_area)
-            alert_pages = alerts_to_pages(alerts)
-            pages = fw_pages + alert_pages
-        finalize_ingest(pages, "weather+alerts")
+    if run_weather_ingest:
+        with st.spinner("Fetching and storing weather and alerts..."):
+            fw_docs = fetch_fire_weather_docs([x.strip() for x in fire_weather_urls_text.splitlines() if x.strip()])
+            alerts = fetch_nws_alerts_for_area(alert_area)
+            alert_docs = alerts_to_docs(alerts)
+            docs = fw_docs + alert_docs
+            added = add_docs(docs)
+            st.session_state.ingest_log.append(f"{utc_now_iso()} | weather+alerts | docs={added}")
+            st.success(f"Added {added} weather/alert docs.")
 
-    if run_upload_ingest and kb_ok:
+    if run_upload_ingest:
         with st.spinner("Reading uploaded files..."):
-            pages = ingest_uploaded_files(uploaded_files)
-        finalize_ingest(pages, "uploads")
+            docs = ingest_uploaded_files(uploaded_files)
+            added = add_docs(docs)
+            st.session_state.ingest_log.append(f"{utc_now_iso()} | uploads | docs={added}")
+            st.success(f"Added {added} uploaded docs.")
 
-    if run_note_ingest and kb_ok:
-        with st.spinner("Indexing note..."):
-            pages = ingest_manual_text(manual_title, manual_text, source_type="note")
-        finalize_ingest(pages, "note")
+    if run_note_ingest:
+        with st.spinner("Storing note..."):
+            docs = ingest_manual_text(manual_title, manual_text, source_type="note")
+            added = add_docs(docs)
+            st.session_state.ingest_log.append(f"{utc_now_iso()} | note | docs={added}")
+            st.success(f"Added {added} note docs.")
 
-    st.markdown("### Latest ingest log")
+    st.markdown("### Ingest log")
     if st.session_state.ingest_log:
-        for row in reversed(st.session_state.ingest_log[-14:]):
+        for row in reversed(st.session_state.ingest_log[-20:]):
             st.code(row)
     else:
         st.info("Nothing ingested yet.")
@@ -1549,51 +926,21 @@ with tabs[3]:
 # LIBRARY TAB
 # =========================================================
 with tabs[4]:
-    kb_ok = True
-    try:
-        kb = get_kb()
-    except Exception as e:
-        kb_ok = False
-        st.error(f"Knowledge base init failed: {e}")
-
-    if kb_ok:
-        st.markdown("### Indexed library preview")
-        preview = kb.peek(50)
-        if preview:
-            rows = []
-            seen = set()
-            for item in preview:
-                md = item["metadata"]
-                key = (md.get("url", ""), md.get("title", ""), md.get("source_type", ""))
-                if key in seen:
-                    continue
-                seen.add(key)
-                rows.append({
-                    "title": md.get("title", ""),
-                    "type": md.get("source_type", ""),
-                    "domain": md.get("source_domain", ""),
-                    "url": md.get("url", ""),
-                    "fetched_at_utc": md.get("fetched_at_utc", ""),
-                })
-            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-        else:
-            st.info("The library is empty.")
-
-        st.markdown("### Recent ingest preview")
-        if st.session_state.latest_docs_preview:
-            st.dataframe(
-                pd.DataFrame([{
-                    "title": x.get("title", ""),
-                    "type": x.get("source_type", ""),
-                    "domain": x.get("source_domain", ""),
-                    "url": x.get("url", ""),
-                    "words": len((x.get("text", "") or "").split()),
-                } for x in st.session_state.latest_docs_preview]),
-                use_container_width=True,
-                hide_index=True,
-            )
-        else:
-            st.info("No recent ingest preview yet.")
+    st.markdown("### Stored document library")
+    if st.session_state.doc_store:
+        rows = []
+        for d in st.session_state.doc_store:
+            rows.append({
+                "title": d.get("title", ""),
+                "type": d.get("source_type", ""),
+                "domain": d.get("source_domain", ""),
+                "url": d.get("url", ""),
+                "words": len((d.get("text", "") or "").split()),
+                "fetched_at_utc": d.get("fetched_at_utc", ""),
+            })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    else:
+        st.info("The library is empty.")
 
 
 # =========================================================
@@ -1602,60 +949,33 @@ with tabs[4]:
 with tabs[5]:
     st.markdown("### Environment")
     st.code(
-        f"CHROMA_DIR={CHROMA_DIR}\n"
-        f"COLLECTION_NAME={COLLECTION_NAME}\n"
-        f"EMBED_MODEL_NAME={EMBED_MODEL_NAME}\n"
         f"OPENAI_MODEL={OPENAI_MODEL}\n"
         f"OPENAI_KEY_SET={'yes' if bool(OPENAI_API_KEY) else 'no'}\n"
         f"INCIWEB_RSS_URL={INCIWEB_RSS_URL}\n"
         f"NIFC_MONTHLY_OUTLOOK_PDF={NIFC_MONTHLY_OUTLOOK_PDF}\n"
         f"NIFC_NA_OUTLOOK_PDF={NIFC_NA_OUTLOOK_PDF}\n"
-        f"NIFC_WEATHER_PAGE={NIFC_WEATHER_PAGE}"
+        f"NIFC_WEATHER_PAGE={NIFC_WEATHER_PAGE}\n"
+        f"STORED_DOCS={len(st.session_state.doc_store)}"
     )
 
     st.markdown("### Package checks")
     st.write({
-        "chromadb": chromadb is not None,
-        "sentence_transformers": SentenceTransformer is not None,
         "openai": OpenAI is not None,
         "pypdf": pypdf is not None,
-        "pydeck": pdk is not None,
         "trafilatura": True,
         "beautifulsoup4": True,
+        "requests": True,
+        "pandas": True,
     })
 
-    kb_ok = True
-    try:
-        kb = get_kb()
-    except Exception as e:
-        kb_ok = False
-        st.error(f"Knowledge base init failed: {e}")
-
-    if kb_ok:
-        st.metric("Current chunk count", f"{kb.count():,}")
-        clear = st.button("CLEAR INDEX")
-        if clear:
-            kb.clear()
-            st.session_state.last_answer = ""
-            st.session_state.last_hits = []
-            st.session_state.last_briefing = ""
-            st.session_state.latest_stats = {"pages": 0, "chunks": 0, "sources": 0}
-            st.session_state.latest_docs_preview = []
-            st.session_state.ingest_log.append(f"{utc_now_iso()} | cleared index")
-            st.success("Vector index cleared.")
+    clear = st.button("CLEAR STORED DOCS")
+    if clear:
+        st.session_state.doc_store = []
+        st.session_state.last_answer = ""
+        st.session_state.last_hits = []
+        st.session_state.last_briefing = ""
+        st.session_state.ingest_log.append(f"{utc_now_iso()} | cleared docs")
+        st.success("Stored docs cleared.")
 
 st.divider()
-st.caption("Wildfire Knowledge Lab Pro | incidents + outlooks + fire weather + alerts + map + grounded retrieval")
-
-
-# =========================================================
-# REQUIREMENTS
-# =========================================================
-# pip install streamlit requests beautifulsoup4 trafilatura chromadb sentence-transformers openai pypdf pandas pydeck
-#
-# streamlit secrets.toml
-# [openai]
-# api_key = "YOUR_KEY_HERE"
-#
-# run:
-# streamlit run app.py
+st.caption("Wildfire Knowledge Lab | incidents + outlooks + fire weather + alerts + uploads + grounded retrieval")
