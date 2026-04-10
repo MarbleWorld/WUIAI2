@@ -1,0 +1,10 @@
+streamlit==1.39.0
+requests==2.31.0
+pandas==2.2.2
+trafilatura==1.12.2
+beautifulsoup4==4.12.3
+chromadb==0.5.23
+sentence-transformers==3.3.1
+openai==1.54.3
+pypdf==5.1.0
+pydeck==0.9.1
