@@ -5,6 +5,3 @@ beautifulsoup4==4.12.3
 trafilatura==1.12.2
 openai==1.51.2
 pypdf==5.0.1
-pydeck==0.9.1
-chromadb==0.5.23
-sentence-transformers==3.2.1
